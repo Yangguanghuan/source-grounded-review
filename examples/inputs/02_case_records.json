@@ -1,0 +1,24 @@
+{
+  "source": "community service case notes",
+  "topic": "digital governance for community elderly-care services",
+  "cases": [
+    {
+      "scenario": "meal delivery and dining service",
+      "finding": "A unified service ledger helped staff compare registered demand with actual meal delivery records and identify older residents who missed repeated meals.",
+      "evidence_boundary": "The record was useful only when service providers updated delivery status on the same day.",
+      "risk": "If cancellation and hospitalisation information is not updated, the ledger may overestimate unmet demand."
+    },
+    {
+      "scenario": "home visit and safety check",
+      "finding": "Regular visit records made it easier to prioritise residents living alone, especially when visit frequency, emergency contacts, and recent health notes were kept together.",
+      "evidence_boundary": "The approach depends on consistent definitions of visit completion and risk level.",
+      "risk": "Sensitive health and family information should be visible only to authorised staff."
+    }
+  ],
+  "recommendations": [
+    "start with a bounded service catalogue",
+    "keep one resident profile across providers",
+    "record service completion and follow-up results",
+    "review high-risk cases through offline staff meetings"
+  ]
+}
