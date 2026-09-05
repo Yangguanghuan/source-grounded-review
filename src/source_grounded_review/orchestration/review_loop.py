@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -32,11 +31,18 @@ from source_grounded_review.steps.selection import SectionSelectionConfig, selec
 from source_grounded_review.core.state_store import OutputRecord, SQLiteStateStore
 from source_grounded_review.core.utils import clean_text, write_csv, write_json, write_text
 from source_grounded_review.steps.writer import write_review_draft
+from source_grounded_review.orchestration.task_planner import (
+    TASK_TOOLS, execute_targeted_task, finish_standard_task, finish_task, plan_next_task, record_stop,
+)
 
 
 RISK_VERDICTS = {"misaligned", "overstated", "needs_more_citation", "unknown_citation"}
 SOFT_REVIEW_VERDICTS = {"partially_supports"}
 REVIEW_STEPS = [
+    "plan_tasks",
+    "retrieve_evidence",
+    "revise_claim",
+    "audit_section",
     "load_corpus",
     "build_source_cards",
     "build_evidence_matrix",
@@ -52,23 +58,6 @@ REVIEW_STEPS = [
 ]
 
 PLANNER_MODES = {"rules", "llm"}
-
-STEP_DESCRIPTIONS = {
-    "load_corpus": "Read user-provided source files and optional reference rows.",
-    "build_source_cards": "Build structured source cards from each readable source.",
-    "build_evidence_matrix": "Extract citable evidence snippets from the source set.",
-    "outline_mapper": "Map sources and evidence to outline sections.",
-    "select_evidence": "Select representative evidence for each outline section.",
-    "build_section_packs": "Assemble the evidence packs used by the writer.",
-    "expand_evidence": "Increase evidence-selection budgets before remapping sections.",
-    "write_draft": "Draft the review from section evidence packs.",
-    "audit_citations": "Check whether cited claims are supported by bound evidence.",
-    "rewrite_draft": "Rewrite the draft using citation-audit feedback.",
-    "coverage_critic": "Check section coverage and source usage after drafting.",
-    "human_review": "Stop automatic work and write manual review notes.",
-    "finalize": "Write all output files and finish the run.",
-}
-
 
 class GraphRuntimeState(TypedDict):
     runtime: "EvidenceState"
@@ -94,6 +83,9 @@ class ReviewLoopConfig:
     max_flagged_claim_ratio: float = 0.25
     max_misaligned_claims: int = 0
     planner_mode: str = "rules"
+    max_agent_tasks: int = 24
+    max_retrieval_tasks: int = 4
+    max_claim_revisions: int = 6
 
 
 @dataclass
@@ -163,6 +155,12 @@ class EvidenceState:
     current_max_evidence_per_section: int = 10
     current_max_evidence_per_ref_section: int = 2
     graph_backend: str = "local_loop"
+    active_task: dict[str, Any] = field(default_factory=dict)
+    task_history: list[dict[str, Any]] = field(default_factory=list)
+    dirty_sections: list[str] = field(default_factory=list)
+    evidence_dirty_sections: list[str] = field(default_factory=list)
+    draft_audited: bool = False
+    coverage_checked: bool = False
     _human_review_keys: set[str] = field(default_factory=set, repr=False)
 
     def snapshot(self, node: str) -> dict[str, Any]:
@@ -188,6 +186,10 @@ class EvidenceState:
             "planner_mode": self.config.planner_mode,
             "human_review_items": len(self.human_review_queue),
             "risk": risk,
+            "task_count": len(self.task_history),
+            "active_task_id": self.active_task.get("task_id"),
+            "dirty_sections": list(self.dirty_sections),
+            "evidence_dirty_sections": list(self.evidence_dirty_sections),
         }
 
 
@@ -213,11 +215,16 @@ def run_review_loop(
     max_misaligned_claims: int = 0,
     graph_backend: str = "auto",
     planner_mode: str = "rules",
+    max_agent_tasks: int = 24,
+    max_retrieval_tasks: int = 4,
+    max_claim_revisions: int = 6,
 ) -> dict[str, str]:
     output_path = Path(output_dir)
     planner_mode = planner_mode.strip().lower()
     if planner_mode not in PLANNER_MODES:
         raise ValueError("planner_mode must be one of: rules, llm")
+    if not 1 <= max_agent_tasks <= 30 or max_retrieval_tasks < 0 or max_claim_revisions < 0:
+        raise ValueError("Agent task budget must be 1-30; tool budgets must be nonnegative")
     config = ReviewLoopConfig(
         evidence_per_source=evidence_per_source,
         max_refs_per_section=max_refs_per_section,
@@ -231,6 +238,9 @@ def run_review_loop(
         max_flagged_claim_ratio=max_flagged_claim_ratio,
         max_misaligned_claims=max_misaligned_claims,
         planner_mode=planner_mode,
+        max_agent_tasks=max_agent_tasks,
+        max_retrieval_tasks=max_retrieval_tasks,
+        max_claim_revisions=max_claim_revisions,
     )
     state = EvidenceState(
         topic=topic,
@@ -345,7 +355,21 @@ def ignore_langgraph_deprecation_warnings() -> None:
 
 
 def run_node(state: EvidenceState, node: str) -> None:
-    if node == "load_corpus":
+    try:
+        _run_node(state, node)
+    except Exception as exc:
+        if state.config.planner_mode != "llm" or state.active_task.get("action") != node:
+            raise
+        finish_task(state, {"criterion_met": False, "error": f"{type(exc).__name__}: {exc}"[:1200]}, status="failed")
+        record_snapshot(state, node)
+
+
+def _run_node(state: EvidenceState, node: str) -> None:
+    if node == "plan_tasks":
+        plan_next_task(state)
+    elif node in TASK_TOOLS:
+        execute_targeted_task(state, node)
+    elif node == "load_corpus":
         state.sections = load_outline(state.outline_file)
         state.documents = load_corpus(state.references_path, state.input_dir, max_sources=state.max_sources)
     elif node == "build_source_cards":
@@ -425,8 +449,12 @@ def run_node(state: EvidenceState, node: str) -> None:
             state.assignments,
             state.section_packs,
             state.usage_rows,
+            min_refs_per_section=state.config.min_refs_per_section,
+            min_evidence_per_section=state.config.min_evidence_per_section,
         )
     elif node == "human_review":
+        if state.active_task.get("action") == "human_review":
+            record_stop(state)
         if not state.human_review_queue:
             queue_human_review(
                 state,
@@ -439,12 +467,29 @@ def run_node(state: EvidenceState, node: str) -> None:
     else:
         raise ValueError(f"Unknown review step: {node}")
 
+    if state.active_task.get("action") == node and node not in TASK_TOOLS:
+        finish_standard_task(state, node)
     record_snapshot(state, node)
 
 
 def route_after_node(state: EvidenceState, after_node: str) -> str:
-    options = route_options_after_node(state, after_node)
-    action, reason, planner_status, planner_raw = select_route(state, after_node, options)
+    if state.config.planner_mode == "llm" and after_node == "plan_tasks":
+        task = state.active_task
+        action, reason = task["action"], task["reason"]
+        planner_status, planner_raw = task["planner_status"], json.dumps(task, ensure_ascii=False)
+        options = [RouteOption(a, "Task tool") for a in task["available_actions"]]
+        if action == "finalize":
+            finish_task(state, {"criterion_met": True})
+    elif state.config.planner_mode == "llm" and (
+        after_node == "build_section_packs" or after_node in TASK_TOOLS
+        or (state.active_task and after_node in {"write_draft", "audit_citations", "coverage_critic"})
+    ):
+        action, reason = "plan_tasks", "Observe tool results and plan the next concrete task."
+        planner_status, planner_raw = "task_observation", ""
+        options = [RouteOption(action, reason)]
+    else:
+        options = route_options_after_node(state, after_node)
+        action, reason, planner_status, planner_raw = select_route(state, after_node, options)
     apply_route_side_effects(state, after_node, action)
     risk = build_risk_summary(state)
 
@@ -478,112 +523,9 @@ def select_route(
 ) -> tuple[str, str, str, str]:
     if not options:
         return "finalize", "No route option was available, so the run is finalized.", "empty_options", ""
-    if state.config.planner_mode != "llm":
-        option = options[0]
-        return option.action, option.reason, "rules", ""
-    if len(options) == 1:
-        option = options[0]
-        return option.action, option.reason, "llm_not_needed_single_option", ""
-    return select_route_with_llm(state, after_node, options)
-
-
-def select_route_with_llm(
-    state: EvidenceState,
-    after_node: str,
-    options: list[RouteOption],
-) -> tuple[str, str, str, str]:
-    candidate_actions = {option.action for option in options}
-    system = (
-        "You are the planning controller for a source-grounded writing system. "
-        "Choose the next workflow action from the provided candidate actions only. "
-        "Prefer evidence expansion or rewriting when the state shows citation or coverage risk. "
-        "Choose human_review when automatic progress is unsafe. "
-        "Return JSON only with keys: next_action, reason."
-    )
-    user = json.dumps(
-        {
-            "topic": state.topic,
-            "after_node": after_node,
-            "state_summary": planner_state_summary(state),
-            "candidate_actions": [
-                {
-                    "action": option.action,
-                    "description": STEP_DESCRIPTIONS.get(option.action, ""),
-                    "default_reason": option.reason,
-                }
-                for option in options
-            ],
-            "recent_decisions": [item.to_dict() for item in state.step_decisions[-5:]],
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-    try:
-        raw = state.llm.complete(system, user, temperature=0.0)
-    except Exception as exc:  # pragma: no cover - provider failures depend on runtime configuration.
-        option = options[0]
-        return option.action, f"{option.reason} Planner call failed: {exc}", "llm_call_failed_fallback_rules", ""
-
-    parsed = parse_planner_json(raw)
-    action = str(parsed.get("next_action") or parsed.get("action") or "").strip()
-    reason = clean_text(str(parsed.get("reason") or ""), 800)
-    if action not in candidate_actions:
-        option = options[0]
-        fallback_reason = option.reason
-        if action:
-            fallback_reason = f"{fallback_reason} Planner proposed invalid action `{action}`, so the guarded default was used."
-        else:
-            fallback_reason = f"{fallback_reason} Planner response did not contain a valid action, so the guarded default was used."
-        return option.action, fallback_reason, "llm_invalid_response_fallback_rules", raw
-    if not reason:
-        reason = next(option.reason for option in options if option.action == action)
-    return action, reason, "llm_selected", raw
-
-
-def parse_planner_json(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if match:
-        text = match.group(0)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def planner_state_summary(state: EvidenceState) -> dict[str, Any]:
-    risk = build_risk_summary(state)
-    weak_sections = section_evidence_gaps(state)
-    return {
-        "counts": {
-            "documents": len(state.documents),
-            "sections": len(state.sections),
-            "source_cards": len(state.cards),
-            "evidence_rows": len(state.evidence_rows),
-            "assignments": len(state.assignments),
-            "section_packs": len(state.section_packs),
-            "audited_claims": len(state.audits),
-            "manual_review_items": len(state.human_review_queue),
-        },
-        "rounds": {
-            "revision_round": state.revision_round,
-            "max_revision_rounds": state.config.max_revision_rounds,
-            "evidence_expansion_round": state.evidence_expansion_round,
-            "max_evidence_expansion_rounds": state.config.max_evidence_expansion_rounds,
-        },
-        "budgets": {
-            "max_sections_per_source": state.current_max_sections_per_source,
-            "max_refs_per_section": state.current_max_refs_per_section,
-            "max_evidence_per_section": state.current_max_evidence_per_section,
-            "max_evidence_per_ref_section": state.current_max_evidence_per_ref_section,
-        },
-        "risk": risk,
-        "weak_sections": weak_sections[:10],
-    }
+    option = options[0]
+    status = "rules" if state.config.planner_mode == "rules" else "preparation"
+    return option.action, option.reason, status, ""
 
 
 def route_options_after_node(state: EvidenceState, after_node: str) -> list[RouteOption]:
@@ -897,6 +839,11 @@ def persist_outputs(state: EvidenceState) -> dict[str, str]:
             state.store.add_output(item)
 
     output_dir = state.output_dir
+    if state.config.planner_mode == "llm":
+        record("task_history_json", write_json(output_dir / "trace" / "task_history.json", state.task_history),
+               "task_history", "task_planner", "Task goals, parameters, criteria, observations and revisions.")
+        record("task_report", write_text(output_dir / "report" / "task_report.md", render_task_report(state)),
+               "task_report", "task_planner")
     record(
         "references_resolved_csv",
         write_csv(output_dir / "corpus" / "references_resolved.csv", references_to_rows(state.documents)),
@@ -1084,7 +1031,7 @@ def persist_outputs(state: EvidenceState) -> dict[str, str]:
     )
     record(
         "evidence_state_sqlite",
-        str(output_dir / "state" / "evidence_state.sqlite"),
+        str(state.store.path if state.store else output_dir / "state" / "evidence_state.sqlite"),
         "sqlite_state_store",
         "state_store",
         "Step decisions, state snapshots, manual review items, and output metadata.",
@@ -1152,6 +1099,11 @@ def build_evidence_notes(
                 "page_hint": item.page_hint,
                 "confidence_score": round(item.score, 4),
                 "evidence_text": item.evidence_text,
+                "source_quote": item.source_quote,
+                "source_context": item.source_context,
+                "source_start": item.source_start,
+                "source_end": item.source_end,
+                "source_sha256": item.source_sha256,
                 "applicable_sections": sections_by_evidence.get(item.evidence_id, []),
                 "validity_boundary": (
                     "Only supports claims directly entailed by evidence_text and the cited source. "
@@ -1160,6 +1112,19 @@ def build_evidence_notes(
             }
         )
     return notes
+
+
+def render_task_report(state: EvidenceState) -> str:
+    lines = ["# Task Report", "", f"Topic: {state.topic}", ""]
+    for task in state.task_history:
+        lines.extend([f"## {task['task_id']}: {task['action']}", "",
+                      f"Goal: {task['goal']}", "", f"Decision: {task['reason']}", "",
+                      f"Status: {task['status']}", "", f"Completion criterion: `{task['success_criterion']}`", "",
+                      "```json", json.dumps({"parameters": task['parameters'],
+                                              "outcome": task.get('outcome', {}),
+                                              "remaining_plan": task.get('remaining_plan', [])},
+                                             ensure_ascii=False, indent=2), "```", ""])
+    return "\n".join(lines)
 
 
 def flatten_evidence_notes(notes: list[dict[str, object]]) -> list[dict[str, object]]:

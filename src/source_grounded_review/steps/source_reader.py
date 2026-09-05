@@ -164,6 +164,15 @@ def model_source_card(document: Document, sections: list[OutlineSection], llm: L
     )
     data = parse_json_object(llm.complete(system, user, temperature=0.0))
     evidence_claims = normalize_evidence_claims(data.get("evidence_claims"), section_titles)
+    windows_by_id = {w["source_window_id"]: w for w in source_windows}
+    verified_claims = []
+    for claim in evidence_claims:
+        window = windows_by_id.get(claim.get("source_window_id"))
+        quote = clean_text(str(claim.get("evidence_quote", "")))
+        if window and quote and quote in clean_text(window["text"]):
+            claim["page_hint"] = window["page_hint"]
+            verified_claims.append(claim)
+    evidence_claims = verified_claims
     key_findings = as_str_list(data.get("key_findings")) or [
         str(item.get("claim", "")).strip() for item in evidence_claims if item.get("claim")
     ][:5]

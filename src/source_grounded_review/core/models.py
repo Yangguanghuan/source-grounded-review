@@ -54,6 +54,11 @@ class Evidence:
     score: float
     evidence_text: str
     source_path: str
+    source_quote: str = ""
+    source_context: str = ""
+    source_start: int = -1
+    source_end: int = -1
+    source_sha256: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -112,6 +117,7 @@ class ClaimAudit:
     best_evidence_ids: list[str]
     relevance_score: float
     rationale: str
+    audit_method: str = "heuristic"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

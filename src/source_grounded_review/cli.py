@@ -81,8 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--planner",
         choices=["rules", "llm"],
         default="rules",
-        help="Route review-loop steps with deterministic rules or with the configured LLM planner.",
+        help="Use rules or an LLM task planner with targeted retrieval, claim revision and re-audit.",
     )
+    parser.add_argument("--max-agent-tasks", type=int, default=24, help="LLM task budget (1-30).")
+    parser.add_argument("--max-retrieval-tasks", type=int, default=4, help="Maximum original-source retrieval tasks.")
+    parser.add_argument("--max-claim-revisions", type=int, default=6, help="Maximum targeted claim revisions.")
     return parser
 
 
@@ -115,6 +118,9 @@ def main() -> None:
             max_misaligned_claims=args.max_misaligned_claims,
             graph_backend=args.graph_backend,
             planner_mode=args.planner,
+            max_agent_tasks=args.max_agent_tasks,
+            max_retrieval_tasks=args.max_retrieval_tasks,
+            max_claim_revisions=args.max_claim_revisions,
         )
     else:
         paths = run_pipeline(**common_args)

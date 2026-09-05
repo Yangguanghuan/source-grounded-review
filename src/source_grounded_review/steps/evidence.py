@@ -38,6 +38,7 @@ def build_evidence_matrix(
                     score=token_score(query, chunk),
                     evidence_text=clean_text(chunk, 1200),
                     source_path=doc.ref.document_path,
+                    source_quote=clean_text(chunk, 1200),
                 )
             )
     return evidence_rows
@@ -71,6 +72,7 @@ def evidence_from_card_claims(
                 score=token_score(query, evidence_text),
                 evidence_text=evidence_text,
                 source_path=document.ref.document_path,
+                source_quote=quote,
             )
         )
     return rows

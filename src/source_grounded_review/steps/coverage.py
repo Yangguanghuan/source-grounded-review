@@ -60,6 +60,9 @@ def build_coverage_critique(
     assignments: list[SourceSectionAssignment],
     packs: list[SectionEvidencePack],
     usage_rows: list[dict[str, object]],
+    *,
+    min_refs_per_section: int = 3,
+    min_evidence_per_section: int = 3,
 ) -> tuple[list[dict[str, object]], str]:
     assigned_refs = {item.ref_id for item in assignments}
     all_refs = {document.ref.ref_id for document in documents}
@@ -71,7 +74,10 @@ def build_coverage_critique(
             "section_title": pack.section_title,
             "assigned_ref_count": len(pack.assigned_ref_ids),
             "evidence_count": len(pack.evidence_ids),
-            "status": "weak" if len(pack.assigned_ref_ids) < 3 or len(pack.evidence_ids) < 3 else "ok",
+            "status": "weak" if (len(pack.assigned_ref_ids) < min_refs_per_section
+                                  or len(pack.evidence_ids) < min_evidence_per_section) else "ok",
+            "min_refs_per_section": min_refs_per_section,
+            "min_evidence_per_section": min_evidence_per_section,
         }
         for pack in packs
     ]

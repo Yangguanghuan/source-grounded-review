@@ -33,6 +33,10 @@ class SQLiteStateStore:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(
+                "CREATE TABLE IF NOT EXISTS task_events "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, event_json TEXT NOT NULL)"
+            )
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS state_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +85,11 @@ class SQLiteStateStore:
                 "INSERT INTO state_snapshots(step, node, snapshot_json) VALUES (?, ?, ?)",
                 (step, node, json.dumps(snapshot, ensure_ascii=False)),
             )
+
+    def add_task_event(self, task: dict[str, Any]) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO task_events(task_id, event_json) VALUES (?, ?)",
+                         (task["task_id"], json.dumps(task, ensure_ascii=False)))
 
     def add_step_decision(
         self,

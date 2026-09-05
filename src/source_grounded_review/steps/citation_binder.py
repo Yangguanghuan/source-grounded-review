@@ -64,7 +64,15 @@ def build_citation_bindings(audits: list[ClaimAudit], evidence_rows: list[Eviden
                         "relevance_score": round(audit.relevance_score, 4),
                         "binding_status": "bound",
                         "evidence_text": evidence.evidence_text,
+                        "source_path": evidence.source_path,
+                        "source_quote": evidence.source_quote,
+                        "source_start": evidence.source_start,
+                        "source_end": evidence.source_end,
+                        "source_sha256": evidence.source_sha256,
                     }
                 )
+    methods = {audit.claim_id: audit.audit_method for audit in audits}
+    for row in rows:
+        row["audit_method"] = methods[str(row["claim_id"])]
     return rows
 

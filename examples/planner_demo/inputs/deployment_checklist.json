@@ -1,0 +1,10 @@
+{
+  "title": "Deployment evaluation checklist",
+  "fixture": "Synthetic example; not an external publication",
+  "evaluation": [
+    "Throughput and latency should be reported with the tested hardware and workload.",
+    "A deployment-cost comparison requires measured hardware, energy, staffing, and operational expenses.",
+    "A throughput improvement alone does not establish lower deployment cost.",
+    "Any recommendation based on the benchmark is limited to the configuration and workload that were evaluated."
+  ]
+}
